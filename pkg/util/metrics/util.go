@@ -21,8 +21,8 @@ import (
 	"sync"
 	"time"
 
-	"k8s.io/kubernetes/pkg/util/flowcontrol"
-	"k8s.io/kubernetes/pkg/util/wait"
+	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/client-go/util/flowcontrol"
 
 	"github.com/golang/glog"
 	"github.com/prometheus/client_golang/prometheus"
@@ -34,7 +34,7 @@ const (
 
 var (
 	metricsLock        sync.Mutex
-	rateLimiterMetrics map[string]prometheus.Gauge = make(map[string]prometheus.Gauge)
+	rateLimiterMetrics = make(map[string]prometheus.Gauge)
 )
 
 func registerRateLimiterMetric(ownerName string) error {
@@ -51,7 +51,9 @@ func registerRateLimiterMetric(ownerName string) error {
 		Help:      fmt.Sprintf("A metric measuring the saturation of the rate limiter for %v", ownerName),
 	})
 	rateLimiterMetrics[ownerName] = metric
-	prometheus.MustRegister(metric)
+	if err := prometheus.Register(metric); err != nil {
+		return fmt.Errorf("error registering rate limiter usage metric: %v", err)
+	}
 	return nil
 }
 

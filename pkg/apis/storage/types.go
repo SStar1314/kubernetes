@@ -17,12 +17,13 @@ limitations under the License.
 package storage
 
 import (
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/kubernetes/pkg/api"
-	"k8s.io/kubernetes/pkg/api/unversioned"
 )
 
-// +genclient=true
-// +nonNamespaced=true
+// +genclient
+// +genclient:nonNamespaced
+// +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
 
 // StorageClass describes a named "class" of storage offered in a cluster.
 // Different classes might map to quality-of-service levels, or to backup policies,
@@ -31,30 +32,51 @@ import (
 // called "profiles" in other storage systems.
 // The name of a StorageClass object is significant, and is how users can request a particular class.
 type StorageClass struct {
-	unversioned.TypeMeta `json:",inline"`
-	api.ObjectMeta       `json:"metadata,omitempty"`
+	metav1.TypeMeta
+	// +optional
+	metav1.ObjectMeta
 
 	// provisioner is the driver expected to handle this StorageClass.
 	// This is an optionally-prefixed name, like a label key.
 	// For example: "kubernetes.io/gce-pd" or "kubernetes.io/aws-ebs".
 	// This value may not be empty.
-	Provisioner string `json:"provisioner"`
+	Provisioner string
 
 	// parameters holds parameters for the provisioner.
 	// These values are opaque to the  system and are passed directly
 	// to the provisioner.  The only validation done on keys is that they are
 	// not empty.  The maximum number of parameters is
 	// 512, with a cumulative max size of 256K
-	Parameters map[string]string `json:"parameters,omitempty"`
+	// +optional
+	Parameters map[string]string
+
+	// reclaimPolicy is the reclaim policy that dynamically provisioned
+	// PersistentVolumes of this storage class are created with
+	// +optional
+	ReclaimPolicy *api.PersistentVolumeReclaimPolicy
+
+	// mountOptions are the mount options that dynamically provisioned
+	// PersistentVolumes of this storage class are created with
+	// +optional
+	MountOptions []string
+
+	// AllowVolumeExpansion shows whether the storage class allow volume expand
+	// If the field is nil or not set, it would amount to expansion disabled
+	// for all PVs created from this storageclass.
+	// +optional
+	AllowVolumeExpansion *bool
 }
+
+// +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
 
 // StorageClassList is a collection of storage classes.
 type StorageClassList struct {
-	unversioned.TypeMeta `json:",inline"`
+	metav1.TypeMeta
 	// Standard list metadata
-	// More info: http://releases.k8s.io/HEAD/docs/devel/api-conventions.md#metadata
-	unversioned.ListMeta `json:"metadata,omitempty"`
+	// More info: https://git.k8s.io/community/contributors/devel/api-conventions.md#metadata
+	// +optional
+	metav1.ListMeta
 
 	// Items is the list of StorageClasses
-	Items []StorageClass `json:"items"`
+	Items []StorageClass
 }

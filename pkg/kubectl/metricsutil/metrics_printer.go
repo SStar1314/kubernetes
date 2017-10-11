@@ -19,11 +19,12 @@ package metricsutil
 import (
 	"fmt"
 	"io"
+	"sort"
 
-	metrics_api "k8s.io/heapster/metrics/apis/metrics/v1alpha1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/kubernetes/pkg/api"
-	"k8s.io/kubernetes/pkg/api/resource"
-	"k8s.io/kubernetes/pkg/kubectl"
+	"k8s.io/kubernetes/pkg/printers"
+	metricsapi "k8s.io/metrics/pkg/apis/metrics/v1alpha1"
 )
 
 var (
@@ -51,12 +52,16 @@ func NewTopCmdPrinter(out io.Writer) *TopCmdPrinter {
 	return &TopCmdPrinter{out: out}
 }
 
-func (printer *TopCmdPrinter) PrintNodeMetrics(metrics []metrics_api.NodeMetrics, availableResources map[string]api.ResourceList) error {
+func (printer *TopCmdPrinter) PrintNodeMetrics(metrics []metricsapi.NodeMetrics, availableResources map[string]api.ResourceList) error {
 	if len(metrics) == 0 {
 		return nil
 	}
-	w := kubectl.GetNewTabWriter(printer.out)
+	w := printers.GetNewTabWriter(printer.out)
 	defer w.Flush()
+
+	sort.Slice(metrics, func(i, j int) bool {
+		return metrics[i].Name < metrics[j].Name
+	})
 
 	printColumnNames(w, NodeColumns)
 	var usage api.ResourceList
@@ -74,11 +79,11 @@ func (printer *TopCmdPrinter) PrintNodeMetrics(metrics []metrics_api.NodeMetrics
 	return nil
 }
 
-func (printer *TopCmdPrinter) PrintPodMetrics(metrics []metrics_api.PodMetrics, printContainers bool, withNamespace bool) error {
+func (printer *TopCmdPrinter) PrintPodMetrics(metrics []metricsapi.PodMetrics, printContainers bool, withNamespace bool) error {
 	if len(metrics) == 0 {
 		return nil
 	}
-	w := kubectl.GetNewTabWriter(printer.out)
+	w := printers.GetNewTabWriter(printer.out)
 	defer w.Flush()
 
 	if withNamespace {
@@ -87,6 +92,14 @@ func (printer *TopCmdPrinter) PrintPodMetrics(metrics []metrics_api.PodMetrics, 
 	if printContainers {
 		printValue(w, PodColumn)
 	}
+
+	sort.Slice(metrics, func(i, j int) bool {
+		if withNamespace && metrics[i].Namespace != metrics[j].Namespace {
+			return metrics[i].Namespace < metrics[j].Namespace
+		}
+		return metrics[i].Name < metrics[j].Name
+	})
+
 	printColumnNames(w, PodColumns)
 	for _, m := range metrics {
 		err := printSinglePodMetrics(w, &m, printContainers, withNamespace)
@@ -104,7 +117,7 @@ func printColumnNames(out io.Writer, names []string) {
 	fmt.Fprint(out, "\n")
 }
 
-func printSinglePodMetrics(out io.Writer, m *metrics_api.PodMetrics, printContainersOnly bool, withNamespace bool) error {
+func printSinglePodMetrics(out io.Writer, m *metricsapi.PodMetrics, printContainersOnly bool, withNamespace bool) error {
 	containers := make(map[string]api.ResourceList)
 	podMetrics := make(api.ResourceList)
 	for _, res := range MeasuredResources {

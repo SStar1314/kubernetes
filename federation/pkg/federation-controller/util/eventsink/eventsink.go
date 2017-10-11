@@ -17,56 +17,95 @@ limitations under the License.
 package eventsink
 
 import (
-	federation_release_1_4 "k8s.io/kubernetes/federation/client/clientset_generated/federation_release_1_4"
-	api "k8s.io/kubernetes/pkg/api"
-	api_v1 "k8s.io/kubernetes/pkg/api/v1"
-	"k8s.io/kubernetes/pkg/client/record"
+	"reflect"
+
+	"k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/conversion"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/record"
+	fedclientset "k8s.io/kubernetes/federation/client/clientset_generated/federation_clientset"
 )
 
-// Implemnts k8s.io/kubernetes/pkg/client/record.EventSink.
+// Implements k8s.io/client-go/tools/record.EventSink.
 type FederatedEventSink struct {
-	clientset federation_release_1_4.Interface
+	clientset fedclientset.Interface
 }
 
 // To check if all required functions are implemented.
 var _ record.EventSink = &FederatedEventSink{}
 
-func NewFederatedEventSink(clientset federation_release_1_4.Interface) *FederatedEventSink {
+func NewFederatedEventSink(clientset fedclientset.Interface) *FederatedEventSink {
 	return &FederatedEventSink{
 		clientset: clientset,
 	}
 }
 
-func (fes *FederatedEventSink) Create(event *api.Event) (*api.Event, error) {
-	return fes.executeOperation(event, func(eventV1 *api_v1.Event) (*api_v1.Event, error) {
-		return fes.clientset.Core().Events(event.Namespace).Create(eventV1)
-	})
-}
+// TODO this is uses a reflection conversion path and is very expensive.  federation should update to use client-go
 
-func (fes *FederatedEventSink) Update(event *api.Event) (*api.Event, error) {
-	return fes.executeOperation(event, func(eventV1 *api_v1.Event) (*api_v1.Event, error) {
-		return fes.clientset.Core().Events(event.Namespace).Update(eventV1)
-	})
-}
+var scheme = runtime.NewScheme()
 
-func (fes *FederatedEventSink) Patch(event *api.Event, data []byte) (*api.Event, error) {
-	return fes.executeOperation(event, func(eventV1 *api_v1.Event) (*api_v1.Event, error) {
-		return fes.clientset.Core().Events(event.Namespace).Patch(event.Name, api.StrategicMergePatchType, data)
-	})
-}
+func init() {
+	// register client-go's and kube's Event type under two different GroupVersions
+	// TODO: switch to client-go client for events
+	scheme.AddKnownTypes(v1.SchemeGroupVersion, &v1.Event{})
+	scheme.AddKnownTypes(schema.GroupVersion{Group: "fake-kube-" + v1.SchemeGroupVersion.Group, Version: v1.SchemeGroupVersion.Version}, &v1.Event{})
 
-func (fes *FederatedEventSink) executeOperation(event *api.Event, operation func(*api_v1.Event) (*api_v1.Event, error)) (*api.Event, error) {
-	var versionedEvent api_v1.Event
-	if err := api.Scheme.Convert(event, &versionedEvent, nil); err != nil {
-		return nil, err
+	if err := scheme.AddConversionFuncs(
+		metav1.Convert_unversioned_Time_To_unversioned_Time,
+	); err != nil {
+		panic(err)
 	}
-	versionedEventPtr, err := operation(&versionedEvent)
+	if err := scheme.AddGeneratedDeepCopyFuncs(
+		conversion.GeneratedDeepCopyFunc{
+			Fn: func(in, out interface{}, c *conversion.Cloner) error {
+				in.(*metav1.Time).DeepCopyInto(out.(*metav1.Time))
+				return nil
+			},
+			InType: reflect.TypeOf(&metav1.Time{}),
+		},
+	); err != nil {
+		panic(err)
+	}
+}
+
+func (fes *FederatedEventSink) Create(event *v1.Event) (*v1.Event, error) {
+	ret, err := fes.clientset.Core().Events(event.Namespace).Create(event)
 	if err != nil {
 		return nil, err
 	}
-	var unversionedEvent api.Event
-	if err := api.Scheme.Convert(versionedEventPtr, &unversionedEvent, nil); err != nil {
+
+	retEvent := &v1.Event{}
+	if err := scheme.Convert(ret, retEvent, nil); err != nil {
 		return nil, err
 	}
-	return &unversionedEvent, nil
+	return retEvent, nil
+}
+
+func (fes *FederatedEventSink) Update(event *v1.Event) (*v1.Event, error) {
+	ret, err := fes.clientset.Core().Events(event.Namespace).Update(event)
+	if err != nil {
+		return nil, err
+	}
+
+	retEvent := &v1.Event{}
+	if err := scheme.Convert(ret, retEvent, nil); err != nil {
+		return nil, err
+	}
+	return retEvent, nil
+}
+
+func (fes *FederatedEventSink) Patch(event *v1.Event, data []byte) (*v1.Event, error) {
+	ret, err := fes.clientset.Core().Events(event.Namespace).Patch(event.Name, types.StrategicMergePatchType, data)
+	if err != nil {
+		return nil, err
+	}
+
+	retEvent := &v1.Event{}
+	if err := scheme.Convert(ret, retEvent, nil); err != nil {
+		return nil, err
+	}
+	return retEvent, nil
 }

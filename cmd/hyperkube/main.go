@@ -17,11 +17,10 @@ limitations under the License.
 // A binary that can morph into all of the other kubernetes binaries. You can
 // also soft-link to it busybox style.
 //
-// CAUTION: If you update code in this file, you may need to also update code
-//          in contrib/mesos/cmd/km/km.go
 package main
 
 import (
+	"fmt"
 	"os"
 
 	_ "k8s.io/kubernetes/pkg/client/metrics/prometheus" // for client metric registration
@@ -38,8 +37,14 @@ func main() {
 	hk.AddServer(NewKubeAPIServer())
 	hk.AddServer(NewKubeControllerManager())
 	hk.AddServer(NewScheduler())
-	hk.AddServer(NewKubelet())
+	if kubelet, err := NewKubelet(); err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	} else {
+		hk.AddServer(kubelet)
+	}
 	hk.AddServer(NewKubeProxy())
+	hk.AddServer(NewKubeAggregator())
 
 	//Federation servers
 	hk.AddServer(NewFederationAPIServer())

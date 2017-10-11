@@ -1,5 +1,5 @@
 /*
-Copyright 2014 The Kubernetes Authors.
+Copyright 2017 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -14,8 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// CAUTION: If you update code in this file, you may need to also update code
-//          in contrib/mesos/cmd/km/hyperkube.go
 package main
 
 import (
@@ -27,12 +25,14 @@ import (
 	"os"
 	"path"
 
-	"k8s.io/kubernetes/pkg/util"
-	utilflag "k8s.io/kubernetes/pkg/util/flag"
-	"k8s.io/kubernetes/pkg/util/logs"
-	"k8s.io/kubernetes/pkg/version/verflag"
-
 	"github.com/spf13/pflag"
+
+	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/apiserver/pkg/server"
+	utilflag "k8s.io/apiserver/pkg/util/flag"
+	"k8s.io/apiserver/pkg/util/logs"
+	utiltemplate "k8s.io/kubernetes/pkg/util/template"
+	"k8s.io/kubernetes/pkg/version/verflag"
 )
 
 // HyperKube represents a single binary that can morph/manage into multiple
@@ -57,7 +57,7 @@ func (hk *HyperKube) AddServer(s *Server) {
 // FindServer will find a specific server named name.
 func (hk *HyperKube) FindServer(name string) (*Server, error) {
 	for _, s := range hk.servers {
-		if s.Name() == name {
+		if s.Name() == name || s.AlternativeName == name {
 			return &s, nil
 		}
 	}
@@ -117,12 +117,11 @@ func (hk *HyperKube) Printf(format string, i ...interface{}) {
 }
 
 // Run the server.  This will pick the appropriate server and run it.
-func (hk *HyperKube) Run(args []string) error {
+func (hk *HyperKube) Run(args []string, stopCh <-chan struct{}) error {
 	// If we are called directly, parse all flags up to the first real
 	// argument.  That should be the server to run.
 	command := args[0]
-	baseCommand := path.Base(command)
-	serverName := baseCommand
+	serverName := path.Base(command)
 	args = args[1:]
 	if serverName == hk.Name {
 
@@ -146,7 +145,6 @@ func (hk *HyperKube) Run(args []string) error {
 		args = baseFlags.Args()
 		if len(args) > 0 && len(args[0]) > 0 {
 			serverName = args[0]
-			baseCommand = baseCommand + " " + serverName
 			args = args[1:]
 		} else {
 			err = errors.New("no server specified")
@@ -178,7 +176,22 @@ func (hk *HyperKube) Run(args []string) error {
 	logs.InitLogs()
 	defer logs.FlushLogs()
 
-	err = s.Run(s, s.Flags().Args())
+	if !s.RespectsStopCh {
+		// For commands that do not respect the stopCh, we run them in a go
+		// routine and leave them running when stopCh is closed.
+		errCh := make(chan error)
+		go func() {
+			errCh <- s.Run(s, s.Flags().Args(), wait.NeverStop)
+		}()
+		select {
+		case <-stopCh:
+			return errors.New("interrupted") // This error text is ignored.
+		case err = <-errCh:
+			// fall-through
+		}
+	} else {
+		err = s.Run(s, s.Flags().Args(), stopCh)
+	}
 	if err != nil {
 		hk.Println("Error:", err)
 	}
@@ -188,12 +201,10 @@ func (hk *HyperKube) Run(args []string) error {
 
 // RunToExit will run the hyperkube and then call os.Exit with an appropriate exit code.
 func (hk *HyperKube) RunToExit(args []string) {
-	err := hk.Run(args)
-	if err != nil {
-		fmt.Fprint(os.Stderr, err.Error())
+	stopCh := server.SetupSignalHandler()
+	if err := hk.Run(args, stopCh); err != nil {
 		os.Exit(1)
 	}
-	os.Exit(0)
 }
 
 // Usage will write out a summary for all servers that this binary supports.
@@ -210,7 +221,7 @@ Servers
 Call '{{.Name}} --make-symlinks' to create symlinks for each server in the local directory.
 Call '{{.Name}} <server> --help' for help on a specific server.
 `
-	util.ExecuteTemplate(hk.Out(), tt, hk)
+	utiltemplate.ExecuteTemplate(hk.Out(), tt, hk)
 }
 
 // MakeSymlinks will create a symlink for each registered hyperkube server in the local directory.

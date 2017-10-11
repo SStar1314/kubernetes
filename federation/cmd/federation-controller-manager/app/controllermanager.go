@@ -20,48 +20,52 @@ limitations under the License.
 package app
 
 import (
-	"fmt"
 	"net"
 	"net/http"
 	"net/http/pprof"
+	"os"
+	goruntime "runtime"
 	"strconv"
+	"time"
 
-	federationclientset "k8s.io/kubernetes/federation/client/clientset_generated/federation_release_1_4"
+	"k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/apiserver/pkg/server/healthz"
+	utilflag "k8s.io/apiserver/pkg/util/flag"
+	"k8s.io/client-go/kubernetes"
+	restclient "k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/clientcmd"
+	"k8s.io/client-go/tools/leaderelection"
+	"k8s.io/client-go/tools/leaderelection/resourcelock"
+	"k8s.io/client-go/tools/record"
+	federationapi "k8s.io/kubernetes/federation/apis/federation/v1beta1"
+	federationclientset "k8s.io/kubernetes/federation/client/clientset_generated/federation_clientset"
 	"k8s.io/kubernetes/federation/cmd/federation-controller-manager/app/options"
-	"k8s.io/kubernetes/federation/pkg/dnsprovider"
+	"k8s.io/kubernetes/federation/pkg/federatedtypes"
 	clustercontroller "k8s.io/kubernetes/federation/pkg/federation-controller/cluster"
 	ingresscontroller "k8s.io/kubernetes/federation/pkg/federation-controller/ingress"
-	namespacecontroller "k8s.io/kubernetes/federation/pkg/federation-controller/namespace"
-	replicasetcontroller "k8s.io/kubernetes/federation/pkg/federation-controller/replicaset"
-	secretcontroller "k8s.io/kubernetes/federation/pkg/federation-controller/secret"
+	jobcontroller "k8s.io/kubernetes/federation/pkg/federation-controller/job"
 	servicecontroller "k8s.io/kubernetes/federation/pkg/federation-controller/service"
-	"k8s.io/kubernetes/federation/pkg/federation-controller/util"
-	"k8s.io/kubernetes/pkg/client/restclient"
-	"k8s.io/kubernetes/pkg/client/unversioned/clientcmd"
-	"k8s.io/kubernetes/pkg/healthz"
+	servicednscontroller "k8s.io/kubernetes/federation/pkg/federation-controller/service/dns"
+	synccontroller "k8s.io/kubernetes/federation/pkg/federation-controller/sync"
+	"k8s.io/kubernetes/federation/pkg/federation-controller/util/eventsink"
+	"k8s.io/kubernetes/pkg/api"
 	"k8s.io/kubernetes/pkg/util/configz"
-	"k8s.io/kubernetes/pkg/util/wait"
 	"k8s.io/kubernetes/pkg/version"
 
 	"github.com/golang/glog"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/client-go/discovery"
 )
 
 const (
-	// TODO(madhusudancs): Consider making this configurable via a flag.
-	// "federation-apiserver-kubeconfig" is a reserved secret name which
-	// stores the kubeconfig for federation-apiserver.
-	KubeconfigSecretName = "federation-apiserver-kubeconfig"
-	// "federation-apiserver-secret" was the old name we used to store
-	// Federation API server kubeconfig secret. Unfortunately, this name
-	// is very close to "federation-apiserver-secrets" and causes a lot
-	// of confusion, particularly while debugging. So deprecating it in
-	// favor of the new name but giving people time to migrate.
-	// TODO(madhusudancs): this name is deprecated in 1.4 and should be
-	// removed in 1.5. Remove it in 1.5.
-	DeprecatedKubeconfigSecretName = "federation-apiserver-secret"
+	apiserverWaitTimeout   = 2 * time.Minute
+	apiserverRetryInterval = 2 * time.Second
 )
 
 // NewControllerManagerCommand creates a *cobra.Command object with default parameters
@@ -92,18 +96,11 @@ func Run(s *options.CMServer) error {
 	} else {
 		glog.Errorf("unable to register configz: %s", err)
 	}
-	// Create the config to talk to federation-apiserver.
-	kubeconfigGetter := util.KubeconfigGetterForSecret(KubeconfigSecretName)
-	restClientCfg, err := clientcmd.BuildConfigFromKubeconfigGetter(s.Master, kubeconfigGetter)
+
+	restClientCfg, err := clientcmd.BuildConfigFromFlags(s.Master, s.Kubeconfig)
 	if err != nil || restClientCfg == nil {
-		// Retry with the deprecated name in 1.4.
-		// TODO(madhusudancs): Remove this in 1.5.
-		var depErr error
-		kubeconfigGetter := util.KubeconfigGetterForSecret(DeprecatedKubeconfigSecretName)
-		restClientCfg, depErr = clientcmd.BuildConfigFromKubeconfigGetter(s.Master, kubeconfigGetter)
-		if depErr != nil {
-			return fmt.Errorf("failed to find the secret containing Federation API server kubeconfig, tried the secret name %s and the deprecated name %s: %v, %v", KubeconfigSecretName, DeprecatedKubeconfigSecretName, err, depErr)
-		}
+		glog.V(2).Infof("Couldn't build the rest client config from flags: %v", err)
+		return err
 	}
 
 	// Override restClientCfg qps/burst settings from flags
@@ -117,6 +114,10 @@ func Run(s *options.CMServer) error {
 			mux.HandleFunc("/debug/pprof/", pprof.Index)
 			mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
 			mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
+			mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
+			if s.EnableContentionProfiling {
+				goruntime.SetBlockProfileRate(1)
+			}
 		}
 		mux.Handle("/metrics", prometheus.Handler())
 
@@ -127,52 +128,191 @@ func Run(s *options.CMServer) error {
 		glog.Fatal(server.ListenAndServe())
 	}()
 
-	run := func() {
-		err := StartControllers(s, restClientCfg)
+	federationClientset, err := federationclientset.NewForConfig(restclient.AddUserAgent(restClientCfg, "federation-controller-manager"))
+	if err != nil {
+		glog.Fatalf("Invalid API configuration: %v", err)
+	}
+
+	run := func(stop <-chan struct{}) {
+		err := StartControllers(s, restClientCfg, stop)
 		glog.Fatalf("error running controllers: %v", err)
 		panic("unreachable")
 	}
-	run()
+
+	if !s.LeaderElection.LeaderElect {
+		run(nil)
+		// unreachable
+	}
+
+	if err := ensureFederationNamespace(federationClientset, s.FederationOnlyNamespace); err != nil {
+		glog.Fatalf("Failed to ensure federation only namespace %s: %v", s.FederationOnlyNamespace, err)
+	}
+
+	leaderElectionClient := kubernetes.NewForConfigOrDie(restclient.AddUserAgent(restClientCfg, "leader-election"))
+	eventBroadcaster := record.NewBroadcaster()
+	eventBroadcaster.StartLogging(glog.Infof)
+	eventBroadcaster.StartRecordingToSink(eventsink.NewFederatedEventSink(federationClientset))
+	recorder := eventBroadcaster.NewRecorder(api.Scheme, v1.EventSource{Component: "controller-manager"})
+
+	id, err := os.Hostname()
+	if err != nil {
+		return err
+	}
+
+	rl := resourcelock.ConfigMapLock{
+		ConfigMapMeta: metav1.ObjectMeta{
+			Namespace: s.FederationOnlyNamespace,
+			Name:      "federation-controller-manager-leader-election",
+			Annotations: map[string]string{
+				federationapi.FederationClusterSelectorAnnotation: federationapi.FederationOnlyClusterSelector,
+			}},
+		Client: leaderElectionClient.CoreV1(),
+		LockConfig: resourcelock.ResourceLockConfig{
+			Identity:      id,
+			EventRecorder: recorder,
+		},
+	}
+
+	leaderelection.RunOrDie(leaderelection.LeaderElectionConfig{
+		Lock:          &rl,
+		LeaseDuration: s.LeaderElection.LeaseDuration.Duration,
+		RenewDeadline: s.LeaderElection.RenewDeadline.Duration,
+		RetryPeriod:   s.LeaderElection.RetryPeriod.Duration,
+		Callbacks: leaderelection.LeaderCallbacks{
+			OnStartedLeading: run,
+			OnStoppedLeading: func() {
+				glog.Fatalf("leaderelection lost")
+			},
+		},
+	})
+
 	panic("unreachable")
 }
 
-func StartControllers(s *options.CMServer, restClientCfg *restclient.Config) error {
-	glog.Infof("Loading client config for cluster controller %q", "cluster-controller")
-	ccClientset := federationclientset.NewForConfigOrDie(restclient.AddUserAgent(restClientCfg, "cluster-controller"))
-	glog.Infof("Running cluster controller")
-	go clustercontroller.NewclusterController(ccClientset, s.ClusterMonitorPeriod.Duration).Run()
-	dns, err := dnsprovider.InitDnsProvider(s.DnsProvider, s.DnsConfigFile)
+func StartControllers(s *options.CMServer, restClientCfg *restclient.Config, stopChan <-chan struct{}) error {
+	minimizeLatency := false
+
+	discoveryClient := discovery.NewDiscoveryClientForConfigOrDie(restClientCfg)
+	serverResources, err := discoveryClient.ServerResources()
 	if err != nil {
-		glog.Fatalf("Cloud provider could not be initialized: %v", err)
+		glog.Fatalf("Could not find resources from API Server: %v", err)
 	}
 
-	glog.Infof("Loading client config for namespace controller %q", "namespace-controller")
-	nsClientset := federationclientset.NewForConfigOrDie(restclient.AddUserAgent(restClientCfg, "namespace-controller"))
-	namespaceController := namespacecontroller.NewNamespaceController(nsClientset)
-	glog.Infof("Running namespace controller")
-	namespaceController.Run(wait.NeverStop)
+	clustercontroller.StartClusterController(restClientCfg, stopChan, s.ClusterMonitorPeriod.Duration)
 
-	secretcontrollerClientset := federationclientset.NewForConfigOrDie(restclient.AddUserAgent(restClientCfg, "secret-controller"))
-	secretcontroller := secretcontroller.NewSecretController(secretcontrollerClientset)
-	secretcontroller.Run(wait.NeverStop)
+	if controllerEnabled(s.Controllers, serverResources, servicecontroller.ControllerName, servicecontroller.RequiredResources, true) {
+		if controllerEnabled(s.Controllers, serverResources, servicednscontroller.ControllerName, servicecontroller.RequiredResources, true) {
+			serviceDNScontrollerClientset := federationclientset.NewForConfigOrDie(restclient.AddUserAgent(restClientCfg, servicednscontroller.UserAgentName))
+			serviceDNSController, err := servicednscontroller.NewServiceDNSController(serviceDNScontrollerClientset, s.DnsProvider, s.DnsConfigFile, s.FederationName, s.ServiceDnsSuffix, s.ZoneName, s.ZoneID)
+			if err != nil {
+				glog.Fatalf("Failed to start service dns controller: %v", err)
+			} else {
+				go serviceDNSController.DNSControllerRun(s.ConcurrentServiceSyncs, wait.NeverStop)
+			}
+		}
 
-	replicaSetClientset := federationclientset.NewForConfigOrDie(restclient.AddUserAgent(restClientCfg, replicasetcontroller.UserAgentName))
-	replicaSetController := replicasetcontroller.NewReplicaSetController(replicaSetClientset)
-	go replicaSetController.Run(s.ConcurrentReplicaSetSyncs, wait.NeverStop)
+		glog.V(3).Infof("Loading client config for service controller %q", servicecontroller.UserAgentName)
+		scClientset := federationclientset.NewForConfigOrDie(restclient.AddUserAgent(restClientCfg, servicecontroller.UserAgentName))
+		serviceController := servicecontroller.New(scClientset)
+		go serviceController.Run(s.ConcurrentServiceSyncs, stopChan)
+	}
 
-	glog.Infof("Loading client config for ingress controller %q", "ingress-controller")
-	ingClientset := federationclientset.NewForConfigOrDie(restclient.AddUserAgent(restClientCfg, "ingress-controller"))
-	ingressController := ingresscontroller.NewIngressController(ingClientset)
-	glog.Infof("Running ingress controller")
-	ingressController.Run(wait.NeverStop)
+	adapterSpecificArgs := make(map[string]interface{})
+	adapterSpecificArgs[federatedtypes.HpaKind] = &s.HpaScaleForbiddenWindow
+	for kind, federatedType := range federatedtypes.FederatedTypes() {
+		if controllerEnabled(s.Controllers, serverResources, federatedType.ControllerName, federatedType.RequiredResources, true) {
+			synccontroller.StartFederationSyncController(kind, federatedType.AdapterFactory, restClientCfg, stopChan, minimizeLatency, adapterSpecificArgs)
+		}
+	}
 
-	glog.Infof("Loading client config for service controller %q", servicecontroller.UserAgentName)
-	scClientset := federationclientset.NewForConfigOrDie(restclient.AddUserAgent(restClientCfg, servicecontroller.UserAgentName))
-	servicecontroller := servicecontroller.New(scClientset, dns, s.FederationName, s.ZoneName)
-	glog.Infof("Running service controller")
-	if err := servicecontroller.Run(s.ConcurrentServiceSyncs, wait.NeverStop); err != nil {
-		glog.Errorf("Failed to start service controller: %v", err)
+	if controllerEnabled(s.Controllers, serverResources, jobcontroller.ControllerName, jobcontroller.RequiredResources, true) {
+		glog.V(3).Infof("Loading client config for job controller %q", jobcontroller.UserAgentName)
+		jobClientset := federationclientset.NewForConfigOrDie(restclient.AddUserAgent(restClientCfg, jobcontroller.UserAgentName))
+		jobController := jobcontroller.NewJobController(jobClientset)
+		glog.V(3).Infof("Running job controller")
+		go jobController.Run(s.ConcurrentJobSyncs, wait.NeverStop)
+	}
+
+	if controllerEnabled(s.Controllers, serverResources, ingresscontroller.ControllerName, ingresscontroller.RequiredResources, true) {
+		glog.V(3).Infof("Loading client config for ingress controller %q", ingresscontroller.UserAgentName)
+		ingClientset := federationclientset.NewForConfigOrDie(restclient.AddUserAgent(restClientCfg, ingresscontroller.UserAgentName))
+		ingressController := ingresscontroller.NewIngressController(ingClientset)
+		glog.V(3).Infof("Running ingress controller")
+		ingressController.Run(stopChan)
 	}
 
 	select {}
+}
+
+func controllerEnabled(controllers utilflag.ConfigurationMap, serverResources []*metav1.APIResourceList, controller string, requiredResources []schema.GroupVersionResource, defaultValue bool) bool {
+	controllerConfig, ok := controllers[controller]
+	if ok {
+		if controllerConfig == "false" {
+			glog.Infof("%s controller disabled by config", controller)
+			return false
+		}
+		if controllerConfig == "true" {
+			if !hasRequiredResources(serverResources, requiredResources) {
+				glog.Fatalf("%s controller enabled explicitly but API Server does not have required resources", controller)
+				panic("unreachable")
+			}
+			return true
+		}
+	} else if defaultValue {
+		if !hasRequiredResources(serverResources, requiredResources) {
+			glog.Warningf("%s controller disabled because API Server does not have required resources", controller)
+			return false
+		}
+	}
+	return defaultValue
+}
+
+func hasRequiredResources(serverResources []*metav1.APIResourceList, requiredResources []schema.GroupVersionResource) bool {
+	for _, resource := range requiredResources {
+		found := false
+		for _, serverResource := range serverResources {
+			if serverResource.GroupVersion == resource.GroupVersion().String() {
+				for _, apiResource := range serverResource.APIResources {
+					if apiResource.Name == resource.Resource {
+						found = true
+						break
+					}
+				}
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	return true
+}
+
+func ensureFederationNamespace(clientset *federationclientset.Clientset, namespace string) error {
+	ns := v1.Namespace{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: namespace,
+			Annotations: map[string]string{
+				federationapi.FederationClusterSelectorAnnotation: federationapi.FederationOnlyClusterSelector,
+			},
+		},
+	}
+	// Probably this is the first operation by controller manager on api server. So retry the operation
+	// until timeout to handle scenario where api server is not yet ready.
+	err := wait.PollImmediate(apiserverRetryInterval, apiserverWaitTimeout, func() (bool, error) {
+		var err error
+		_, err = clientset.CoreV1().Namespaces().Get(namespace, metav1.GetOptions{})
+		if err != nil {
+			if !errors.IsNotFound(err) {
+				glog.V(2).Infof("Failed to get namespace %s: %v", namespace, err)
+				return false, nil
+			}
+			_, err := clientset.CoreV1().Namespaces().Create(&ns)
+			if err != nil {
+				glog.V(2).Infof("Failed to create namespace %s: %v", namespace, err)
+				return false, nil
+			}
+		}
+		return true, nil
+	})
+	return err
 }

@@ -1,13 +1,13 @@
 # Cluster Federation
 
 Kubernetes Cluster Federation enables users to federate multiple
-Kubernetes clusters. Please see the [user guide](http://kubernetes.io/docs/admin/federation/)
-and the [admin guide](http://kubernetes.io/docs/user-guide/federation/federated-services/)
+Kubernetes clusters. Please see the [user guide](https://kubernetes.io/docs/concepts/cluster-administration/federation-service-discovery/)
+and the [admin guide](https://kubernetes.io/docs/tutorials/federation/set-up-cluster-federation-kubefed/)
 for more details about setting up and using the Cluster Federation.
 
 # Building Kubernetes Cluster Federation
 
-Please see the [Kubernetes Development Guide](https://github.com/kubernetes/kubernetes/blob/master/docs/devel/development.md)
+Please see the [Kubernetes Development Guide](https://github.com/kubernetes/community/blob/master/contributors/devel/development.md)
 for initial setup. Once you have the development environment setup
 as explained in that guide, you also need to install [`jq`](https://stedolan.github.io/jq/download/)
 <!-- TODO(madhusudancs): Re-evaluate using jq even in the development
@@ -35,7 +35,7 @@ make push
 
 To initialize the deployment run:
 
-(This pull the installer images)
+(This pulls the installer images)
 
 ```shell
 make init
@@ -57,22 +57,7 @@ make destroy
 
 # Ideas for improvement
 
-1. Split the `build` phase (make recipe) into multiple phases:
-    1. `init`: pull installer images
-    2. `build-binaries`
-    3. `build-docker`
-    4. `build`: build-binary + build-docker
-    5. `push`: to push the built images
-    6. `genconfig`
-    7. `deploy-clusters`
-    8. `deploy-federation`
-    9. `deploy`: deploy-clusters + deploy-federation
-    10. `destroy-federation`
-    11. `destroy-clusters`
-    12. `destroy`: destroy-federation + destroy-clusters
-    13. `redeploy-federation`: just redeploys the federation components.
-
-2. Continue with `destroy` phase even in the face of errors.
+1. Continue with `destroy` phase even in the face of errors.
 
    The bash script sets `set -e errexit` which causes the script to exit
    at the very first error. This should be the default mode for deploying

@@ -32,14 +32,25 @@ type Interface interface {
 	Allocate(net.IP) error
 	AllocateNext() (net.IP, error)
 	Release(net.IP) error
+	ForEach(func(net.IP))
+
+	// For testing
+	Has(ip net.IP) bool
 }
 
 var (
 	ErrFull              = errors.New("range is full")
-	ErrNotInRange        = errors.New("provided IP is not in the valid range")
 	ErrAllocated         = errors.New("provided IP is already allocated")
 	ErrMismatchedNetwork = errors.New("the provided network does not match the current range")
 )
+
+type ErrNotInRange struct {
+	ValidRange string
+}
+
+func (e *ErrNotInRange) Error() string {
+	return fmt.Sprintf("provided IP is not in the valid range. The range of valid IPs is %s", e.ValidRange)
+}
 
 // Range is a contiguous block of IPs that can be allocated atomically.
 //
@@ -89,6 +100,19 @@ func NewCIDRRange(cidr *net.IPNet) *Range {
 	})
 }
 
+// NewFromSnapshot allocates a Range and initializes it from a snapshot.
+func NewFromSnapshot(snap *api.RangeAllocation) (*Range, error) {
+	_, ipnet, err := net.ParseCIDR(snap.Range)
+	if err != nil {
+		return nil, err
+	}
+	r := NewCIDRRange(ipnet)
+	if err := r.Restore(ipnet, snap.Data); err != nil {
+		return nil, err
+	}
+	return r, nil
+}
+
 func maximum(a, b int) int {
 	if a > b {
 		return a
@@ -101,6 +125,16 @@ func (r *Range) Free() int {
 	return r.alloc.Free()
 }
 
+// Used returns the count of IP addresses used in the range.
+func (r *Range) Used() int {
+	return r.max - r.alloc.Free()
+}
+
+// CIDR returns the CIDR covered by the range.
+func (r *Range) CIDR() net.IPNet {
+	return *r.net
+}
+
 // Allocate attempts to reserve the provided IP. ErrNotInRange or
 // ErrAllocated will be returned if the IP is not valid for this range
 // or has already been reserved.  ErrFull will be returned if there
@@ -108,7 +142,7 @@ func (r *Range) Free() int {
 func (r *Range) Allocate(ip net.IP) error {
 	ok, offset := r.contains(ip)
 	if !ok {
-		return ErrNotInRange
+		return &ErrNotInRange{r.net.String()}
 	}
 
 	allocated, err := r.alloc.Allocate(offset)
@@ -144,6 +178,14 @@ func (r *Range) Release(ip net.IP) error {
 	}
 
 	return r.alloc.Release(offset)
+}
+
+// ForEach calls the provided function for each allocated IP.
+func (r *Range) ForEach(fn func(net.IP)) {
+	r.alloc.ForEach(func(offset int) {
+		ip, _ := GetIndexedIP(r.net, offset+1) // +1 because Range doesn't store IP 0
+		fn(ip)
+	})
 }
 
 // Has returns true if the provided IP is already allocated and a call

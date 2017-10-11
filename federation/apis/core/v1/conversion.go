@@ -17,10 +17,8 @@ limitations under the License.
 package v1
 
 import (
-	"fmt"
-
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/kubernetes/pkg/api/v1"
-	"k8s.io/kubernetes/pkg/runtime"
 )
 
 func addConversionFuncs(scheme *runtime.Scheme) error {
@@ -28,8 +26,6 @@ func addConversionFuncs(scheme *runtime.Scheme) error {
 	err := scheme.AddConversionFuncs(
 		v1.Convert_v1_DeleteOptions_To_api_DeleteOptions,
 		v1.Convert_api_DeleteOptions_To_v1_DeleteOptions,
-		v1.Convert_v1_ExportOptions_To_api_ExportOptions,
-		v1.Convert_api_ExportOptions_To_v1_ExportOptions,
 		v1.Convert_v1_List_To_api_List,
 		v1.Convert_api_List_To_v1_List,
 		v1.Convert_v1_ListOptions_To_api_ListOptions,
@@ -40,8 +36,6 @@ func addConversionFuncs(scheme *runtime.Scheme) error {
 		v1.Convert_api_ObjectMeta_To_v1_ObjectMeta,
 		v1.Convert_v1_ObjectReference_To_api_ObjectReference,
 		v1.Convert_api_ObjectReference_To_v1_ObjectReference,
-		v1.Convert_v1_OwnerReference_To_api_OwnerReference,
-		v1.Convert_api_OwnerReference_To_v1_OwnerReference,
 		v1.Convert_v1_Secret_To_api_Secret,
 		v1.Convert_api_Secret_To_v1_Secret,
 		v1.Convert_v1_SecretList_To_api_SecretList,
@@ -63,24 +57,6 @@ func addConversionFuncs(scheme *runtime.Scheme) error {
 		return err
 	}
 
-	// Add field label conversions for kinds having selectable nothing but ObjectMeta fields.
-	for _, kind := range []string{
-		"Service",
-	} {
-		err = scheme.AddFieldLabelConversionFunc("v1", kind,
-			func(label, value string) (string, string, error) {
-				switch label {
-				case "metadata.namespace",
-					"metadata.name":
-					return label, value, nil
-				default:
-					return "", "", fmt.Errorf("field label %q not supported for %q", label, kind)
-				}
-			})
-		if err != nil {
-			return err
-		}
-	}
 	if err := v1.AddFieldLabelConversionsForEvent(scheme); err != nil {
 		return nil
 	}

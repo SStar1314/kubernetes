@@ -22,28 +22,27 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
-	federation_v1beta1 "k8s.io/kubernetes/federation/apis/federation/v1beta1"
-	federationclientset "k8s.io/kubernetes/federation/client/clientset_generated/federation_release_1_4"
-	controller_util "k8s.io/kubernetes/federation/pkg/federation-controller/util"
+	"k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/uuid"
+	restclient "k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/clientcmd"
+	federationv1beta1 "k8s.io/kubernetes/federation/apis/federation/v1beta1"
+	federationclientset "k8s.io/kubernetes/federation/client/clientset_generated/federation_clientset"
 	"k8s.io/kubernetes/pkg/api/testapi"
-	"k8s.io/kubernetes/pkg/api/unversioned"
-	"k8s.io/kubernetes/pkg/api/v1"
-	"k8s.io/kubernetes/pkg/client/restclient"
-	"k8s.io/kubernetes/pkg/client/unversioned/clientcmd"
-	clientcmdapi "k8s.io/kubernetes/pkg/client/unversioned/clientcmd/api"
-	"k8s.io/kubernetes/pkg/util/uuid"
 )
 
-func newCluster(clusterName string, serverUrl string) *federation_v1beta1.Cluster {
-	cluster := federation_v1beta1.Cluster{
-		TypeMeta: unversioned.TypeMeta{APIVersion: testapi.Federation.GroupVersion().String()},
-		ObjectMeta: v1.ObjectMeta{
+func newCluster(clusterName string, serverUrl string) *federationv1beta1.Cluster {
+	cluster := federationv1beta1.Cluster{
+		TypeMeta: metav1.TypeMeta{APIVersion: testapi.Federation.GroupVersion().String()},
+		ObjectMeta: metav1.ObjectMeta{
 			UID:  uuid.NewUUID(),
 			Name: clusterName,
 		},
-		Spec: federation_v1beta1.ClusterSpec{
-			ServerAddressByClientCIDRs: []federation_v1beta1.ServerAddressByClientCIDR{
+		Spec: federationv1beta1.ClusterSpec{
+			ServerAddressByClientCIDRs: []federationv1beta1.ServerAddressByClientCIDR{
 				{
 					ClientCIDR:    "0.0.0.0/0",
 					ServerAddress: serverUrl,
@@ -54,13 +53,13 @@ func newCluster(clusterName string, serverUrl string) *federation_v1beta1.Cluste
 	return &cluster
 }
 
-func newClusterList(cluster *federation_v1beta1.Cluster) *federation_v1beta1.ClusterList {
-	clusterList := federation_v1beta1.ClusterList{
-		TypeMeta: unversioned.TypeMeta{APIVersion: testapi.Federation.GroupVersion().String()},
-		ListMeta: unversioned.ListMeta{
+func newClusterList(cluster *federationv1beta1.Cluster) *federationv1beta1.ClusterList {
+	clusterList := federationv1beta1.ClusterList{
+		TypeMeta: metav1.TypeMeta{APIVersion: testapi.Federation.GroupVersion().String()},
+		ListMeta: metav1.ListMeta{
 			SelfLink: "foobar",
 		},
-		Items: []federation_v1beta1.Cluster{},
+		Items: []federationv1beta1.Cluster{},
 	}
 	clusterList.Items = append(clusterList.Items, *cluster)
 	return &clusterList
@@ -68,7 +67,7 @@ func newClusterList(cluster *federation_v1beta1.Cluster) *federation_v1beta1.Clu
 
 // init a fake http handler, simulate a federation apiserver, response the "DELETE" "PUT" "GET" "UPDATE"
 // when "canBeGotten" is false, means that user can not get the cluster cluster from apiserver
-func createHttptestFakeHandlerForFederation(clusterList *federation_v1beta1.ClusterList, canBeGotten bool) *http.HandlerFunc {
+func createHttptestFakeHandlerForFederation(clusterList *federationv1beta1.ClusterList, canBeGotten bool) *http.HandlerFunc {
 	fakeHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		clusterListString, _ := json.Marshal(*clusterList)
 		w.Header().Set("Content-Type", "application/json")
@@ -124,16 +123,9 @@ func TestUpdateClusterStatusOK(t *testing.T) {
 	}
 	federationClientSet := federationclientset.NewForConfigOrDie(restclient.AddUserAgent(restClientCfg, "cluster-controller"))
 
-	// Override KubeconfigGetterForCluster to avoid having to setup service accounts and mount files with secret tokens.
-	originalGetter := controller_util.KubeconfigGetterForCluster
-	controller_util.KubeconfigGetterForCluster = func(c *federation_v1beta1.Cluster) clientcmd.KubeconfigGetter {
-		return func() (*clientcmdapi.Config, error) {
-			return &clientcmdapi.Config{}, nil
-		}
-	}
-
-	manager := NewclusterController(federationClientSet, 5)
-	err = manager.UpdateClusterStatus()
+	manager := newClusterController(federationClientSet, 5)
+	manager.addToClusterSet(federationCluster)
+	err = manager.updateClusterStatus()
 	if err != nil {
 		t.Errorf("Failed to Update Cluster Status: %v", err)
 	}
@@ -141,11 +133,41 @@ func TestUpdateClusterStatusOK(t *testing.T) {
 	if !found {
 		t.Errorf("Failed to Update Cluster Status")
 	} else {
-		if (clusterStatus.Conditions[1].Status != v1.ConditionFalse) || (clusterStatus.Conditions[1].Type != federation_v1beta1.ClusterOffline) {
+		if (clusterStatus.Conditions[1].Status != v1.ConditionFalse) || (clusterStatus.Conditions[1].Type != federationv1beta1.ClusterOffline) {
 			t.Errorf("Failed to Update Cluster Status")
 		}
 	}
+}
 
-	// Reset KubeconfigGetterForCluster
-	controller_util.KubeconfigGetterForCluster = originalGetter
+// Test races between informer's updates and routine updates of cluster status
+// Issue https://github.com/kubernetes/kubernetes/issues/49958
+func TestUpdateClusterRace(t *testing.T) {
+	clusterName := "foobarCluster"
+	// create dummy httpserver
+	testClusterServer := httptest.NewServer(createHttptestFakeHandlerForCluster(true))
+	defer testClusterServer.Close()
+	federationCluster := newCluster(clusterName, testClusterServer.URL)
+	federationClusterList := newClusterList(federationCluster)
+
+	testFederationServer := httptest.NewServer(createHttptestFakeHandlerForFederation(federationClusterList, true))
+	defer testFederationServer.Close()
+
+	restClientCfg, err := clientcmd.BuildConfigFromFlags(testFederationServer.URL, "")
+	if err != nil {
+		t.Errorf("Failed to build client config")
+	}
+	federationClientSet := federationclientset.NewForConfigOrDie(restclient.AddUserAgent(restClientCfg, "cluster-controller"))
+
+	manager := newClusterController(federationClientSet, 1*time.Millisecond)
+
+	stop := make(chan struct{})
+	manager.Run(stop)
+
+	// try to trigger the race in UpdateClusterStatus
+	for i := 0; i < 10; i++ {
+		manager.addToClusterSet(federationCluster)
+		manager.delFromClusterSet(federationCluster)
+	}
+
+	close(stop)
 }

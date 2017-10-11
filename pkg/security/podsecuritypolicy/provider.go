@@ -18,12 +18,13 @@ package podsecuritypolicy
 
 import (
 	"fmt"
+	"strings"
 
+	"k8s.io/apimachinery/pkg/util/validation/field"
 	"k8s.io/kubernetes/pkg/api"
 	"k8s.io/kubernetes/pkg/apis/extensions"
 	psputil "k8s.io/kubernetes/pkg/security/podsecuritypolicy/util"
 	"k8s.io/kubernetes/pkg/util/maps"
-	"k8s.io/kubernetes/pkg/util/validation/field"
 )
 
 // used to pass in the field being validated for reusable group strategies so they
@@ -103,6 +104,18 @@ func (s *simpleProvider) CreatePodSecurityContext(pod *api.Pod) (*api.PodSecurit
 		sc.SELinuxOptions = seLinux
 	}
 
+	// This is only generated on the pod level.  Containers inherit the pod's profile.  If the
+	// container has a specific profile set then it will be caught in the validation step.
+	seccompProfile, err := s.strategies.SeccompStrategy.Generate(annotations, pod)
+	if err != nil {
+		return nil, nil, err
+	}
+	if seccompProfile != "" {
+		if annotations == nil {
+			annotations = map[string]string{}
+		}
+		annotations[api.SeccompPodAnnotationKey] = seccompProfile
+	}
 	return sc, annotations, nil
 }
 
@@ -152,7 +165,7 @@ func (s *simpleProvider) CreateContainerSecurityContext(pod *api.Pod, container 
 	// if we're using the non-root strategy set the marker that this container should not be
 	// run as root which will signal to the kubelet to do a final check either on the runAsUser
 	// or, if runAsUser is not set, the image UID will be checked.
-	if s.psp.Spec.RunAsUser.Rule == extensions.RunAsUserStrategyMustRunAsNonRoot {
+	if sc.RunAsNonRoot == nil && s.psp.Spec.RunAsUser.Rule == extensions.RunAsUserStrategyMustRunAsNonRoot {
 		nonRoot := true
 		sc.RunAsNonRoot = &nonRoot
 	}
@@ -168,6 +181,17 @@ func (s *simpleProvider) CreateContainerSecurityContext(pod *api.Pod, container 
 	if s.psp.Spec.ReadOnlyRootFilesystem && sc.ReadOnlyRootFilesystem == nil {
 		readOnlyRootFS := true
 		sc.ReadOnlyRootFilesystem = &readOnlyRootFS
+	}
+
+	// if the PSP sets DefaultAllowPrivilegeEscalation and the container security context
+	// allowPrivilegeEscalation is not set, then default to that set by the PSP.
+	if s.psp.Spec.DefaultAllowPrivilegeEscalation != nil && sc.AllowPrivilegeEscalation == nil {
+		sc.AllowPrivilegeEscalation = s.psp.Spec.DefaultAllowPrivilegeEscalation
+	}
+
+	// if the PSP sets psp.AllowPrivilegeEscalation to false set that as the default
+	if !s.psp.Spec.AllowPrivilegeEscalation && sc.AllowPrivilegeEscalation == nil {
+		sc.AllowPrivilegeEscalation = &s.psp.Spec.AllowPrivilegeEscalation
 	}
 
 	return sc, annotations, nil
@@ -188,6 +212,7 @@ func (s *simpleProvider) ValidatePodSecurityContext(pod *api.Pod, fldPath *field
 	}
 	allErrs = append(allErrs, s.strategies.FSGroupStrategy.Validate(pod, fsGroups)...)
 	allErrs = append(allErrs, s.strategies.SupplementalGroupStrategy.Validate(pod, pod.Spec.SecurityContext.SupplementalGroups)...)
+	allErrs = append(allErrs, s.strategies.SeccompStrategy.ValidatePod(pod)...)
 
 	// make a dummy container context to reuse the selinux strategies
 	container := &api.Container{
@@ -212,9 +237,10 @@ func (s *simpleProvider) ValidatePodSecurityContext(pod *api.Pod, fldPath *field
 
 	allErrs = append(allErrs, s.strategies.SysctlsStrategy.Validate(pod)...)
 
-	// TODO(timstclair): ValidatePodSecurityContext should be renamed to ValidatePod since its scope
+	// TODO(tallclair): ValidatePodSecurityContext should be renamed to ValidatePod since its scope
 	// is not limited to the PodSecurityContext.
-	if len(pod.Spec.Volumes) > 0 && !psputil.PSPAllowsAllVolumes(s.psp) {
+	if len(pod.Spec.Volumes) > 0 {
+		allowsAllVolumeTypes := psputil.PSPAllowsAllVolumes(s.psp)
 		allowedVolumes := psputil.FSTypeToStringSet(s.psp.Spec.Volumes)
 		for i, v := range pod.Spec.Volumes {
 			fsType, err := psputil.GetVolumeFSType(v)
@@ -223,10 +249,19 @@ func (s *simpleProvider) ValidatePodSecurityContext(pod *api.Pod, fldPath *field
 				continue
 			}
 
-			if !allowedVolumes.Has(string(fsType)) {
+			if !allowsAllVolumeTypes && !allowedVolumes.Has(string(fsType)) {
 				allErrs = append(allErrs, field.Invalid(
 					field.NewPath("spec", "volumes").Index(i), string(fsType),
 					fmt.Sprintf("%s volumes are not allowed to be used", string(fsType))))
+				continue
+			}
+
+			if fsType == extensions.HostPath {
+				if !psputil.AllowsHostVolumePath(s.psp, v.HostPath.Path) {
+					allErrs = append(allErrs, field.Invalid(
+						field.NewPath("spec", "volumes").Index(i).Child("hostPath", "pathPrefix"), v.HostPath.Path,
+						fmt.Sprintf("is not allowed to be used")))
+				}
 			}
 		}
 	}
@@ -247,6 +282,7 @@ func (s *simpleProvider) ValidateContainerSecurityContext(pod *api.Pod, containe
 	allErrs = append(allErrs, s.strategies.RunAsUserStrategy.Validate(pod, container)...)
 	allErrs = append(allErrs, s.strategies.SELinuxStrategy.Validate(pod, container)...)
 	allErrs = append(allErrs, s.strategies.AppArmorStrategy.Validate(pod, container)...)
+	allErrs = append(allErrs, s.strategies.SeccompStrategy.ValidateContainer(pod, container)...)
 
 	if !s.psp.Spec.Privileged && *sc.Privileged {
 		allErrs = append(allErrs, field.Invalid(fldPath.Child("privileged"), *sc.Privileged, "Privileged containers are not allowed"))
@@ -286,15 +322,24 @@ func (s *simpleProvider) ValidateContainerSecurityContext(pod *api.Pod, containe
 		}
 	}
 
+	if !s.psp.Spec.AllowPrivilegeEscalation && sc.AllowPrivilegeEscalation == nil {
+		allErrs = append(allErrs, field.Invalid(fldPath.Child("allowPrivilegeEscalation"), sc.AllowPrivilegeEscalation, "Allowing privilege escalation for containers is not allowed"))
+
+	}
+
+	if !s.psp.Spec.AllowPrivilegeEscalation && sc.AllowPrivilegeEscalation != nil && *sc.AllowPrivilegeEscalation {
+		allErrs = append(allErrs, field.Invalid(fldPath.Child("allowPrivilegeEscalation"), *sc.AllowPrivilegeEscalation, "Allowing privilege escalation for containers is not allowed"))
+	}
+
 	return allErrs
 }
 
-// hasHostPort checks the port definitions on the container for HostPort > 0.
+// hasInvalidHostPort checks whether the port definitions on the container fall outside of the ranges allowed by the PSP.
 func (s *simpleProvider) hasInvalidHostPort(container *api.Container, fldPath *field.Path) field.ErrorList {
 	allErrs := field.ErrorList{}
 	for _, cp := range container.Ports {
 		if cp.HostPort > 0 && !s.isValidHostPort(int(cp.HostPort)) {
-			detail := fmt.Sprintf("Host port %d is not allowed to be used.  Allowed ports: %v", cp.HostPort, s.psp.Spec.HostPorts)
+			detail := fmt.Sprintf("Host port %d is not allowed to be used. Allowed ports: [%s]", cp.HostPort, hostPortRangesToString(s.psp.Spec.HostPorts))
 			allErrs = append(allErrs, field.Invalid(fldPath.Child("hostPort"), cp.HostPort, detail))
 		}
 	}
@@ -314,4 +359,20 @@ func (s *simpleProvider) isValidHostPort(port int) bool {
 // Get the name of the PSP that this provider was initialized with.
 func (s *simpleProvider) GetPSPName() string {
 	return s.psp.Name
+}
+
+func hostPortRangesToString(ranges []extensions.HostPortRange) string {
+	formattedString := ""
+	if ranges != nil {
+		strRanges := []string{}
+		for _, r := range ranges {
+			if r.Min == r.Max {
+				strRanges = append(strRanges, fmt.Sprintf("%d", r.Min))
+			} else {
+				strRanges = append(strRanges, fmt.Sprintf("%d-%d", r.Min, r.Max))
+			}
+		}
+		formattedString = strings.Join(strRanges, ",")
+	}
+	return formattedString
 }

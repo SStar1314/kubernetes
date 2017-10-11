@@ -17,27 +17,24 @@ limitations under the License.
 package poddisruptionbudget
 
 import (
-	"fmt"
-	"reflect"
-
+	apiequality "k8s.io/apimachinery/pkg/api/equality"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/util/validation/field"
+	genericapirequest "k8s.io/apiserver/pkg/endpoints/request"
+	"k8s.io/apiserver/pkg/storage/names"
 	"k8s.io/kubernetes/pkg/api"
 	"k8s.io/kubernetes/pkg/apis/policy"
 	"k8s.io/kubernetes/pkg/apis/policy/validation"
-	"k8s.io/kubernetes/pkg/fields"
-	"k8s.io/kubernetes/pkg/labels"
-	"k8s.io/kubernetes/pkg/registry/generic"
-	"k8s.io/kubernetes/pkg/runtime"
-	"k8s.io/kubernetes/pkg/util/validation/field"
 )
 
 // podDisruptionBudgetStrategy implements verification logic for PodDisruptionBudgets.
 type podDisruptionBudgetStrategy struct {
 	runtime.ObjectTyper
-	api.NameGenerator
+	names.NameGenerator
 }
 
 // Strategy is the default logic that applies when creating and updating PodDisruptionBudget objects.
-var Strategy = podDisruptionBudgetStrategy{api.Scheme, api.SimpleNameGenerator}
+var Strategy = podDisruptionBudgetStrategy{api.Scheme, names.SimpleNameGenerator}
 
 // NamespaceScoped returns true because all PodDisruptionBudget' need to be within a namespace.
 func (podDisruptionBudgetStrategy) NamespaceScoped() bool {
@@ -45,7 +42,7 @@ func (podDisruptionBudgetStrategy) NamespaceScoped() bool {
 }
 
 // PrepareForCreate clears the status of an PodDisruptionBudget before creation.
-func (podDisruptionBudgetStrategy) PrepareForCreate(ctx api.Context, obj runtime.Object) {
+func (podDisruptionBudgetStrategy) PrepareForCreate(ctx genericapirequest.Context, obj runtime.Object) {
 	podDisruptionBudget := obj.(*policy.PodDisruptionBudget)
 	// create cannot set status
 	podDisruptionBudget.Status = policy.PodDisruptionBudgetStatus{}
@@ -54,7 +51,7 @@ func (podDisruptionBudgetStrategy) PrepareForCreate(ctx api.Context, obj runtime
 }
 
 // PrepareForUpdate clears fields that are not allowed to be set by end users on update.
-func (podDisruptionBudgetStrategy) PrepareForUpdate(ctx api.Context, obj, old runtime.Object) {
+func (podDisruptionBudgetStrategy) PrepareForUpdate(ctx genericapirequest.Context, obj, old runtime.Object) {
 	newPodDisruptionBudget := obj.(*policy.PodDisruptionBudget)
 	oldPodDisruptionBudget := old.(*policy.PodDisruptionBudget)
 	// Update is not allowed to set status
@@ -62,14 +59,14 @@ func (podDisruptionBudgetStrategy) PrepareForUpdate(ctx api.Context, obj, old ru
 
 	// Any changes to the spec increment the generation number, any changes to the
 	// status should reflect the generation number of the corresponding object.
-	// See api.ObjectMeta description for more information on Generation.
-	if !reflect.DeepEqual(oldPodDisruptionBudget.Spec, newPodDisruptionBudget.Spec) {
+	// See metav1.ObjectMeta description for more information on Generation.
+	if !apiequality.Semantic.DeepEqual(oldPodDisruptionBudget.Spec, newPodDisruptionBudget.Spec) {
 		newPodDisruptionBudget.Generation = oldPodDisruptionBudget.Generation + 1
 	}
 }
 
 // Validate validates a new PodDisruptionBudget.
-func (podDisruptionBudgetStrategy) Validate(ctx api.Context, obj runtime.Object) field.ErrorList {
+func (podDisruptionBudgetStrategy) Validate(ctx genericapirequest.Context, obj runtime.Object) field.ErrorList {
 	podDisruptionBudget := obj.(*policy.PodDisruptionBudget)
 	return validation.ValidatePodDisruptionBudget(podDisruptionBudget)
 }
@@ -84,36 +81,16 @@ func (podDisruptionBudgetStrategy) AllowCreateOnUpdate() bool {
 }
 
 // ValidateUpdate is the default update validation for an end user.
-func (podDisruptionBudgetStrategy) ValidateUpdate(ctx api.Context, obj, old runtime.Object) field.ErrorList {
+func (podDisruptionBudgetStrategy) ValidateUpdate(ctx genericapirequest.Context, obj, old runtime.Object) field.ErrorList {
 	validationErrorList := validation.ValidatePodDisruptionBudget(obj.(*policy.PodDisruptionBudget))
 	updateErrorList := validation.ValidatePodDisruptionBudgetUpdate(obj.(*policy.PodDisruptionBudget), old.(*policy.PodDisruptionBudget))
 	return append(validationErrorList, updateErrorList...)
 }
 
-// AllowUnconditionalUpdate is the default update policy for PodDisruptionBudget objects.
+// AllowUnconditionalUpdate is the default update policy for PodDisruptionBudget objects. Status update should
+// only be allowed if version match.
 func (podDisruptionBudgetStrategy) AllowUnconditionalUpdate() bool {
-	return true
-}
-
-// PodDisruptionBudgetToSelectableFields returns a field set that represents the object.
-func PodDisruptionBudgetToSelectableFields(podDisruptionBudget *policy.PodDisruptionBudget) fields.Set {
-	return generic.ObjectMetaFieldsSet(&podDisruptionBudget.ObjectMeta, true)
-}
-
-// MatchPodDisruptionBudget is the filter used by the generic etcd backend to watch events
-// from etcd to clients of the apiserver only interested in specific labels/fields.
-func MatchPodDisruptionBudget(label labels.Selector, field fields.Selector) *generic.SelectionPredicate {
-	return &generic.SelectionPredicate{
-		Label: label,
-		Field: field,
-		GetAttrs: func(obj runtime.Object) (labels.Set, fields.Set, error) {
-			podDisruptionBudget, ok := obj.(*policy.PodDisruptionBudget)
-			if !ok {
-				return nil, nil, fmt.Errorf("given object is not a PodDisruptionBudget.")
-			}
-			return labels.Set(podDisruptionBudget.ObjectMeta.Labels), PodDisruptionBudgetToSelectableFields(podDisruptionBudget), nil
-		},
-	}
+	return false
 }
 
 type podDisruptionBudgetStatusStrategy struct {
@@ -123,7 +100,7 @@ type podDisruptionBudgetStatusStrategy struct {
 var StatusStrategy = podDisruptionBudgetStatusStrategy{Strategy}
 
 // PrepareForUpdate clears fields that are not allowed to be set by end users on update of status
-func (podDisruptionBudgetStatusStrategy) PrepareForUpdate(ctx api.Context, obj, old runtime.Object) {
+func (podDisruptionBudgetStatusStrategy) PrepareForUpdate(ctx genericapirequest.Context, obj, old runtime.Object) {
 	newPodDisruptionBudget := obj.(*policy.PodDisruptionBudget)
 	oldPodDisruptionBudget := old.(*policy.PodDisruptionBudget)
 	// status changes are not allowed to update spec
@@ -131,7 +108,7 @@ func (podDisruptionBudgetStatusStrategy) PrepareForUpdate(ctx api.Context, obj, 
 }
 
 // ValidateUpdate is the default update validation for an end user updating status
-func (podDisruptionBudgetStatusStrategy) ValidateUpdate(ctx api.Context, obj, old runtime.Object) field.ErrorList {
+func (podDisruptionBudgetStatusStrategy) ValidateUpdate(ctx genericapirequest.Context, obj, old runtime.Object) field.ErrorList {
 	// TODO: Validate status updates.
 	return field.ErrorList{}
 	// return validation.ValidatePodDisruptionBudgetStatusUpdate(obj.(*policy.PodDisruptionBudget), old.(*policy.PodDisruptionBudget))
